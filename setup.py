@@ -9,7 +9,7 @@ setuptools.setup(
     url="http://github.com/sai-prasanna/dreamerv2",
     long_description=pathlib.Path("README.md").read_text(),
     long_description_content_type="text/markdown",
-    packages=["dreamerv2", "dreamerv2_torch.common"],
+    packages=["dreamerv2_torch", "dreamerv2_torch.common"],
     package_data={"dreamerv2_torch": ["configs.yaml"]},
     entry_points={"console_scripts": ["dreamerv2_torch=dreamerv2_torch.train:main"]},
     install_requires=[

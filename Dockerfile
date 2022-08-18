@@ -1,4 +1,4 @@
-FROM tensorflow/tensorflow:2.4.2-gpu
+FROM pytorch/pytorch:1.12.1-cuda11.3-cudnn8-runtime
 
 # System packages.
 RUN apt-get update && apt-get install -y \
@@ -22,8 +22,7 @@ RUN pip3 install --no-cache-dir \
   atari_py \
   crafter \
   dm_control \
-  ruamel.yaml \
-  tensorflow_probability==0.12.2
+  ruamel.yaml
 
 # Atari ROMS.
 RUN wget -L -nv http://www.atarimania.com/roms/Roms.rar && \
@@ -38,11 +37,10 @@ RUN echo "$MUJOCO_KEY" > /root/.mujoco/mjkey.txt
 RUN cat /root/.mujoco/mjkey.txt
 
 # DreamerV2.
-ENV TF_XLA_FLAGS --tf_xla_auto_jit=2
 COPY . /app
 WORKDIR /app
 CMD [ \
-  "python3", "dreamerv2/train.py", \
+  "python3", "dreamerv2_torch/train.py", \
   "--logdir", "/logdir/$(date +%Y%m%d-%H%M%S)", \
   "--configs", "defaults", "atari", \
   "--task", "atari_pong" \

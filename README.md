@@ -1,13 +1,7 @@
-WIP Implementation dreamerv2 in pytorch. It's aimed to mirror the tensorflow implementation.
-
-**Status:** Stable release
-
-[![PyPI](https://img.shields.io/pypi/v/dreamerv2.svg)](https://pypi.python.org/pypi/dreamerv2/#history)
 
 # Mastering Atari with Discrete World Models
 
-Implementation of the [DreamerV2][website] agent in TensorFlow 2. Training
-curves for all 55 games are included.
+Implementation of the [DreamerV2][website] agent in pytorch. It mirrors the original [tensorflow implementaition](https://github.com/danijar/dreamerv2) in it's structure for the most part.
 
 <p align="center">
 <img width="90%" src="https://imgur.com/gO1rvEn.gif">
@@ -56,7 +50,7 @@ and straight-through gradients.
 For more information:
 
 - [Google AI Blog post](https://ai.googleblog.com/2021/02/mastering-atari-with-discrete-world.html)
-- [Project website](https://danijar.com/dreamerv2/)
+- [Project website](https://danijar.com/dreamerv2_torch/)
 - [Research paper](https://arxiv.org/pdf/2010.02193.pdf)
 
 ## Using the Package
@@ -95,20 +89,20 @@ the dependencies on your system.
 Get dependencies:
 
 ```sh
-pip3 install tensorflow==2.6.0 tensorflow_probability ruamel.yaml 'gym[atari]' dm_control
+pip3 install torch ruamel.yaml 'gym[atari]' dm_control
 ```
 
 Train on Atari:
 
 ```sh
-python3 dreamerv2/train.py --logdir ~/logdir/atari_pong/dreamerv2/1 \
+python3 dreamerv2_torch/train.py --logdir ~/logdir/atari_pong/dreamerv2_torch/1 \
   --configs atari --task atari_pong
 ```
 
 Train on DM Control:
 
 ```sh
-python3 dreamerv2/train.py --logdir ~/logdir/dmc_walker_walk/dreamerv2/1 \
+python3 dreamerv2_torch/train.py --logdir ~/logdir/dmc_walker_walk/dreamerv2_torch/1 \
   --configs dmc_vision --task dmc_walker_walk
 ```
 
@@ -127,7 +121,7 @@ python3 common/plot.py --indir ~/logdir --outdir ~/plots \
 
 ## Docker Instructions
 
-The [Dockerfile](https://github.com/danijar/dreamerv2/blob/main/Dockerfile)
+The [Dockerfile](https://github.com/danijar/dreamerv2_torch/blob/main/Dockerfile)
 lets you run DreamerV2 without installing its dependencies in your system. This
 requires you to have Docker with GPU access set up.
 
@@ -142,7 +136,7 @@ Train on Atari:
 ```sh
 docker build -t dreamerv2 .
 docker run -it --rm --gpus all -v ~/logdir:/logdir dreamerv2 \
-  python3 dreamerv2/train.py --logdir /logdir/atari_pong/dreamerv2/1 \
+  python3 dreamerv2_torch/train.py --logdir /logdir/atari_pong/dreamerv2_torch/1 \
     --configs atari --task atari_pong
 ```
 
@@ -151,7 +145,7 @@ Train on DM Control:
 ```sh
 docker build -t dreamerv2 . --build-arg MUJOCO_KEY="$(cat ~/.mujoco/mjkey.txt)"
 docker run -it --rm --gpus all -v ~/logdir:/logdir dreamerv2 \
-  python3 dreamerv2/train.py --logdir /logdir/dmc_walker_walk/dreamerv2/1 \
+  python3 dreamerv2_torch/train.py --logdir /logdir/dmc_walker_walk/dreamerv2_torch/1 \
     --configs dmc_vision --task dmc_walker_walk
 ```
 
