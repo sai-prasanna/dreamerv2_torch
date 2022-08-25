@@ -3,6 +3,7 @@ import functools
 import logging
 import os
 import pathlib
+import random
 import re
 import sys
 import warnings
@@ -39,6 +40,10 @@ def main():
     for name in parsed.configs:
         config = config.update(configs[name])
     config = common.Flags(config).parse(remaining)
+
+    torch.manual_seed(config.seed)
+    np.random.seed(config.seed)
+    random.seed(config.seed)
 
     logdir = pathlib.Path(config.logdir).expanduser()
     logdir.mkdir(parents=True, exist_ok=True)
@@ -151,6 +156,9 @@ def main():
     eval_dataset = iter(eval_replay.dataset(**config.dataset))
 
     agnt = agent.Agent(config, obs_space, act_space, step).to(config.device)
+    print(f"Number of parameters in WorldModel {sum(p.numel() for p in agnt.wm.parameters() if p.requires_grad)}")
+    print(f"Number of parameters in Actor {sum(p.numel() for p in agnt._task_behavior.actor.parameters() if p.requires_grad)}")
+    print(f"Number of parameters in Critic {sum(p.numel() for p in agnt._task_behavior.critic.parameters() if p.requires_grad)}")
     agnt.requires_grad_(False)
     train_agent = common.CarryOverState(agnt.train)
     train_agent(next(train_dataset))

@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 
 
-class Optimizer():
+class Optimizer:
     def __init__(
         self,
         name,
@@ -24,16 +24,16 @@ class Optimizer():
         assert 0 <= wd < 1
         assert not clip or 1 <= clip
         self._name = name
-        self._params = parameters
+        self._params = list(parameters)
         self._clip = clip
         self._wd = wd
         self._wd_pattern = wd_pattern
         self._opt = {
-            "adam": lambda: torch.optim.Adam(parameters, lr=lr, eps=eps),
+            "adam": lambda: torch.optim.Adam(self._params, lr=lr, eps=eps),
             "nadam": lambda: NotImplemented(f"{config.opt} is not implemented"),
-            "adamax": lambda: torch.optim.Adamax(parameters, lr=lr, eps=eps),
-            "sgd": lambda: torch.optim.SGD(parameters, lr=lr),
-            "momentum": lambda: torch.optim.SGD(parameters, lr=lr, momentum=0.9),
+            "adamax": lambda: torch.optim.Adamax(self._params, lr=lr, eps=eps),
+            "sgd": lambda: torch.optim.SGD(self._params, lr=lr),
+            "momentum": lambda: torch.optim.SGD(self._params, lr=lr, momentum=0.9),
         }[opt]()
         self._scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 

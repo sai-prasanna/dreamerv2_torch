@@ -9,7 +9,15 @@ import torch.nn as nn
 import torch.distributions as td
 import torch.functional as F
 
-from .dists import OneHotDist, ContDist, TanhBijector, SampleDist, SafeTruncatedNormal
+import common
+from .dists import (
+    Bernoulli,
+    OneHotDist,
+    ContDist,
+    TanhBijector,
+    SampleDist,
+    TruncNormalDist,
+)
 
 # Represents TD model in PlaNET
 class EnsembleRSSM(nn.Module):
@@ -35,46 +43,36 @@ class EnsembleRSSM(nn.Module):
         min_std: float = 0.1,
         norm="none",
     ):
-        """Initializes RSSM
-
-        Args:
-            action_size (int): Action space size
-            embed_size (int): Size of ConvEncoder embedding
-            stoch (int): Size of the distributional hidden state
-            deter (int): Size of the deterministic hidden state
-            hidden (int): General size of hidden layers
-            act (Any): Activation function
-        """
         super().__init__()
         self._stoch = stoch
-        self._discrete = discrete
         self._deter = deter
+        self._hidden = hidden
+        self._discrete = discrete
         if self._discrete:
             imag_input_dim = self._discrete * self._stoch + action_size
             self.state_dim = self._discrete * self._stoch + self._deter
         else:
             imag_input_dim = self._stoch + action_size
             self.state_dim = self._stoch + self._deter
-        self.hidden_size = hidden
-        self.act = get_act(act)
-        obs_layer = [nn.Linear(embed_size + deter, hidden)]
+        self._act = get_act(act)
+        obs_out_layer = [nn.Linear(embed_size + deter, hidden)]
         if norm == "layer":
-            obs_layer.append(nn.LayerNorm(hidden))
-        obs_layer.append(self.act())
-        self.obs_layer = nn.Sequential(*obs_layer)
+            obs_out_layer.append(nn.LayerNorm(hidden))
+        obs_out_layer.append(self._act())
+        self.obs_out_layer = nn.Sequential(*obs_out_layer)
 
         if self._discrete > 0:
             self.obs_suff_stats = nn.Linear(hidden, stoch * discrete)
         else:
             self.obs_suff_stats = nn.Linear(hidden, 2 * stoch)
 
-        self.cell = GRUCell(inp_size=self.hidden_size, out_size=self._deter, norm=True)
+        self.cell = GRUCell(inp_size=self._hidden, out_size=self._deter, norm=True)
         img_inp = [nn.Linear(imag_input_dim, hidden)]
         if norm == "layer":
             img_inp.append(nn.LayerNorm(hidden))
-        img_inp.append(self.act())
+        img_inp.append(self._act())
 
-        self.img_inp = nn.Sequential(*img_inp)
+        self.img_inp_layer = nn.Sequential(*img_inp)
 
         img_suff_stats_ensemble = []
         for i in range(ensemble):
@@ -82,7 +80,7 @@ class EnsembleRSSM(nn.Module):
             img_layers.append(nn.Linear(deter, hidden))
             if norm == "layer":
                 img_layers.append(nn.LayerNorm(hidden))
-            img_layers.append(self.act())
+            img_layers.append(self._act())
             if self._discrete > 0:
                 img_layers.append(nn.Linear(hidden, stoch * discrete))
             else:
@@ -149,93 +147,51 @@ class EnsembleRSSM(nn.Module):
         if state is None:
             state = self.initial(action.size()[0])
 
-        if embed.dim() <= 2:
-            embed = torch.unsqueeze(embed, 1)
-
-        if action.dim() <= 2:
-            action = torch.unsqueeze(action, 1)
-
         embed, action, is_first = (
             swap(embed),
             swap(action),
             swap(is_first),
         )  # T x B x enc_dim, T x B x action_dim
-        posts = {k: [] for k in state.keys()}
-        priors = {k: [] for k in state.keys()}
-        last_post, last_prior = (state, state)
-        for index in range(len(action)):
-            # Tuple of post and prior
-            last_post, last_prior = self.obs_step(
-                last_post, action[index], embed[index], is_first[index]
-            )
-            for k, v in last_post.items():
-                posts[k].append(v)
-            for k, v in last_prior.items():
-                priors[k].append(v)
 
-        post = {k: swap(torch.stack(v, dim=0)) for k, v in posts.items()}
-        prior = {k: swap(torch.stack(v, dim=0)) for k, v in priors.items()}
-
+        post, prior = common.static_scan(
+            lambda prev, *inputs: self.obs_step(prev[0], *inputs),
+            (action, embed, is_first),
+            (state, state),
+        )
+        post = {k: swap(v) for k, v in post.items()}
+        prior = {k: swap(v) for k, v in prior.items()}
         return post, prior
 
-    def kl_loss(self, post, prior, forward, balance, free, free_avg):
-        kld = td.kl.kl_divergence
-        dist = lambda x: self._get_dist(x)
-        sg = lambda x: {k: v.detach() for k, v in x.items()}
-        lhs, rhs = (prior, post) if forward else (post, prior)
-        mix = balance if forward else (1 - balance)
-        if balance == 0.5:
-            value = kld(
-                dist(lhs) if self._discrete else dist(lhs)._dist,
-                dist(rhs) if self._discrete else dist(rhs)._dist,
-            )
-            loss = torch.mean(torch.maximum(value, free))
-        else:
-            value_lhs = value = kld(
-                dist(lhs) if self._discrete else dist(lhs)._dist,
-                dist(sg(rhs)) if self._discrete else dist(sg(rhs))._dist,
-            )
-            value_rhs = kld(
-                dist(sg(lhs)) if self._discrete else dist(sg(lhs))._dist,
-                dist(rhs) if self._discrete else dist(rhs)._dist,
-            )
-            if free_avg:
-                loss_lhs = torch.maximum(torch.mean(value_lhs), torch.Tensor([free])[0])
-                loss_rhs = torch.maximum(torch.mean(value_rhs), torch.Tensor([free])[0])
-            else:
-                loss_lhs = torch.maximum(value_lhs, torch.Tensor([free])[0]).mean()
-                loss_rhs = torch.maximum(value_rhs, torch.Tensor([free])[0]).mean()
-
-            loss = mix * loss_lhs + (1 - mix) * loss_rhs
-        return loss, value
-
     def imagine(self, action: Tensor, state: List[Tensor] = None) -> List[Tensor]:
-        """Imagines the trajectory starting from state through a list of actions.
-        Similar to observe(), requires rolling out the RNN for each timestep.
-
-        Args:
-            action (Tensor): Actions
-            state (List[Tensor]): Starting state before rollout
-
-        Returns:
-            Prior states
-        """
-        if state is None:
-            state = self.get_initial_state(action.size()[0])
         swap = lambda x: x.permute([1, 0] + list(range(2, len(x.shape))))
-
+        if state is None:
+            state = self.initial(action.shape[0])
+        assert isinstance(state, dict), state
+        action = action
         action = swap(action)
-
-        indices = range(len(action))
-        priors = {k: [] for k in state.keys()}
-        last = state
-        for index in indices:
-            last = self.img_step(last, action[index])
-            for k, v in last.items():
-                priors[k].append(v)
-
-        prior = {k: swap(torch.stack(v, dim=0)) for k, v in priors.items()}
+        prior = common.static_scan(self.img_step, [action], state)
+        prior = prior[0]
+        prior = {k: swap(v) for k, v in prior.items()}
         return prior
+
+    def get_feat(self, state: Dict[str, Tensor]) -> Tensor:
+        # Constructs feature for input to reward, decoder, actor, critic
+        stoch = state["stoch"]
+        if self._discrete:
+            shape = stoch.shape[:-2] + (self._stoch * self._discrete,)
+            stoch = stoch.reshape(shape)
+        return torch.concat([stoch, state["deter"]], -1)
+
+    def get_dist(self, state: Dict[str, Tensor], ensemble=False) -> Tensor:
+        if ensemble:
+            state = self._suff_stats_ensemble(state["deter"])
+        if self._discrete:
+            logit = state["logit"]
+            dist = td.Independent(OneHotDist(logits=logit), 1)
+        else:
+            mean, std = state["mean"], state["std"]
+            dist = ContDist(td.Independent(td.Normal(mean, std), 1))
+        return dist
 
     def obs_step(
         self,
@@ -264,27 +220,12 @@ class EnsembleRSSM(nn.Module):
         )
         prior = self.img_step(prev_state, prev_action)
         x = torch.cat([prior["deter"], embed], dim=-1)
-        x = self.obs_layer(x)
-        stats = self._get_suff_stats(x, self.obs_suff_stats)
-        dist = self._get_dist(stats)
-        stoch = dist.rsample() if sample else dist.mode()
+        x = self.obs_out_layer(x)
+        stats = self._suff_stats(x, self.obs_suff_stats)
+        dist = self.get_dist(stats)
+        stoch = dist.sample() if sample else dist.mode()
         post = {"stoch": stoch, "deter": prior["deter"], **stats}
         return post, prior
-
-    def _get_suff_stats(self, x, suff_stats_module):
-        x = suff_stats_module(x)
-        if self._discrete > 0:
-            stats = {"logit": x.view(x.shape[:-1] + (self._stoch, self._discrete))}
-        else:
-            mean, std = torch.chunk(x, 2, dim=-1)
-            std = {
-                "softplus": lambda: F.Softplus()(std),
-                "sigmoid": lambda: torch.sigmoid(std),
-                "sigmoid2": lambda: 2 * torch.sigmoid(std / 2),
-            }[self.std_act]()
-            std = std + self.min_std
-            stats = {"mean": mean, "std": std}
-        return stats
 
     def img_step(
         self, prev_state: Dict[str, Tensor], prev_action: Tensor, sample=True
@@ -301,12 +242,12 @@ class EnsembleRSSM(nn.Module):
         prev_stoch = prev_state["stoch"]
         if self._discrete:
             shape = list(prev_stoch.shape[:-2]) + [self._stoch * self._discrete]
-            prev_stoch = prev_stoch.view(shape)
+            prev_stoch = prev_stoch.reshape(shape)
         x = torch.cat([prev_stoch, prev_action], dim=-1)
-        x = self.img_inp(x)
+        x = self.img_inp_layer(x)
         deter = self.cell(x, prev_state["deter"])
         x = deter
-        stats = self._get_suff_stats_ensemble(x)
+        stats = self._suff_stats_ensemble(x)
         index = (
             torch.randint(len(self.img_suff_stats_ensemble))
             if len(self.img_suff_stats_ensemble) > 1
@@ -314,37 +255,64 @@ class EnsembleRSSM(nn.Module):
         )
         # Pick one randomly
         stats = {k: v[index] for k, v in stats.items()}
-        dist = self._get_dist(stats)
-        stoch = dist.rsample() if sample else dist.mode()
+        dist = self.get_dist(stats)
+        stoch = dist.sample() if sample else dist.mode()
         prior = {"stoch": stoch, "deter": deter, **stats}
         return prior
 
-    def get_feature(self, state: Dict[str, Tensor]) -> Tensor:
-        # Constructs feature for input to reward, decoder, actor, critic
-        stoch = state["stoch"]
-        if self._discrete:
-            shape = stoch.shape[:-2] + (self._stoch * self._discrete,)
-            stoch = stoch.view(shape)
-        return torch.concat([stoch, state["deter"]], -1)
-
-    def _get_suff_stats_ensemble(self, inp):
+    def _suff_stats_ensemble(self, inp):
         # TODO: Optimize with torch vmap
-        stats = [self._get_suff_stats(inp, m) for m in self.img_suff_stats_ensemble]
+        stats = [self._suff_stats(inp, m) for m in self.img_suff_stats_ensemble]
         # We are relying on the fact that stats[0].keys() is ordered the same always
         # True in python 3.8 and above I guess
         stats = {k: torch.stack([x[k] for x in stats]) for k in stats[0].keys()}
         return stats
 
-    def _get_dist(self, state: Dict[str, Tensor], ensemble=False) -> Tensor:
-        if ensemble:
-            state = self._get_suff_stats_ensemble(state["deter"])
-        if self._discrete:
-            logit = state["logit"]
-            dist = td.Independent(OneHotDist(logits=logit), 1)
+    def _suff_stats(self, x, suff_stats_module):
+        x = suff_stats_module(x)
+        if self._discrete > 0:
+            stats = {"logit": x.view(x.shape[:-1] + (self._stoch, self._discrete))}
         else:
-            mean, std = state["mean"], state["std"]
-            dist = ContDist(td.Independent(td.Normal(mean, std), 1))
-        return dist
+            mean, std = torch.chunk(x, 2, dim=-1)
+            std = {
+                "softplus": lambda: F.Softplus()(std),
+                "sigmoid": lambda: torch.sigmoid(std),
+                "sigmoid2": lambda: 2 * torch.sigmoid(std / 2),
+            }[self.std_act]()
+            std = std + self.min_std
+            stats = {"mean": mean, "std": std}
+        return stats
+
+    def kl_loss(self, post, prior, forward, balance, free, free_avg):
+        kld = td.kl.kl_divergence
+        dist = lambda x: self.get_dist(x)
+        sg = lambda x: {k: v.detach() for k, v in x.items()}
+        lhs, rhs = (prior, post) if forward else (post, prior)
+        mix = balance if forward else (1 - balance)
+        if balance == 0.5:
+            value = kld(
+                dist(lhs) if self._discrete else dist(lhs)._dist,
+                dist(rhs) if self._discrete else dist(rhs)._dist,
+            )
+            loss = torch.mean(torch.maximum(value, free))
+        else:
+            value_lhs = value = kld(
+                dist(lhs) if self._discrete else dist(lhs)._dist,
+                dist(sg(rhs)) if self._discrete else dist(sg(rhs))._dist,
+            )
+            value_rhs = kld(
+                dist(sg(lhs)) if self._discrete else dist(sg(lhs))._dist,
+                dist(rhs) if self._discrete else dist(rhs)._dist,
+            )
+            if free_avg:
+                loss_lhs = torch.maximum(torch.mean(value_lhs), torch.Tensor([free])[0])
+                loss_rhs = torch.maximum(torch.mean(value_rhs), torch.Tensor([free])[0])
+            else:
+                loss_lhs = torch.maximum(value_lhs, torch.Tensor([free])[0]).mean()
+                loss_rhs = torch.maximum(value_rhs, torch.Tensor([free])[0]).mean()
+
+            loss = mix * loss_lhs + (1 - mix) * loss_rhs
+        return loss, value
 
 
 class Encoder(nn.Module):
@@ -433,6 +401,7 @@ class ConvEncoder(nn.Module):
                 inp_dim = 2 ** (i - 1) * self._depth
             depth = 2**i * self._depth
             layers.append(nn.Conv2d(inp_dim, depth, kernel, stride=2))
+            print(inp_dim, depth, kernel)
             layers.append(self._act())
         self.layers = nn.Sequential(*layers)
 
@@ -458,18 +427,76 @@ class ConvEncoder(nn.Module):
         return shapes
 
 
+# class Decoder(nn.Module):
+#     def __init__(
+#         self,
+#         shapes: Dict[str, List[List[int]]],
+#         latent_dim: int,
+#         cnn_enc_shapes: List[List[int]],
+#         enc_conv_kernels: Sequence[int],
+#         mlp_hidden_layers: Sequence[int] = (400, 400, 400, 400, 400),
+#         act: str = "ELU",
+#         norm: str = "none",
+#         cnn_keys: str = r".*",
+#         mlp_keys: str = r".*",
+#     ):
+#         super(Decoder, self).__init__()
+#         self._shapes = shapes
+#         self._act = act
+#         self.cnn_keys = [
+#             k for k, v in shapes.items() if re.match(cnn_keys, k) and len(v) == 3
+#         ]
+#         self.mlp_keys = [
+#             k for k, v in shapes.items() if re.match(mlp_keys, k) and len(v) == 1
+#         ]
+#         self.cnn_enc_shapes = cnn_enc_shapes
+
+#         if self.cnn_keys:
+#             self.cnn_decoder = TConvDecoder(
+#                 latent_dim, cnn_enc_shapes, enc_conv_kernels, act
+#             )
+#         if self.mlp_keys:
+#             state_dim = sum([self._shapes[k][-1] for k in self.mlp_keys])
+#             mlp_hidden_layers = [latent_dim] + list(mlp_hidden_layers) + [state_dim]
+#             self.mlp_decoder = MLP(mlp_hidden_layers, act, norm)
+
+#     def forward(self, features):
+#         dists = {}
+#         if self.cnn_keys:
+#             cnn_outputs = [self._shapes[k][-1] for k in self.cnn_keys]
+#             cnn_out = self.cnn_decoder(features)
+#             means = torch.split(cnn_out, cnn_outputs, -1)
+#             dists.update(
+#                 {
+#                     key: ContDist(td.Independent(td.Normal(mean, 1), 3))
+#                     for key, mean in zip(self.cnn_keys, means)
+#                 }
+#             )
+#         if self.mlp_keys:
+#             mlp_outputs = [self._shapes[k][0] for k in self.mlp_keys]
+#             mlp_out = self.mlp_decoder(features)
+#             means = torch.split(mlp_out, mlp_outputs, -1)
+#             dists.update(
+#                 {
+#                     key: ContDist(td.Independent(td.Normal(mean, 1), 1))  # MSE
+#                     for key, mean in zip(self.mlp_keys, means)
+#                 }
+#             )
+#         return dists
+
+
 class Decoder(nn.Module):
     def __init__(
         self,
         shapes: Dict[str, List[List[int]]],
         latent_dim: int,
-        cnn_enc_shapes: List[List[int]],
-        enc_conv_kernels: Sequence[int],
-        mlp_hidden_layers: Sequence[int] = (400, 400, 400, 400, 400),
-        act: str = "ELU",
-        norm: str = "none",
-        cnn_keys: str = r".*",
-        mlp_keys: str = r".*",
+        cnn_keys=r".*",
+        mlp_keys=r".*",
+        act="ELU",
+        norm="none",
+        cnn_depth=48,
+        cnn_kernels=(4, 4, 4, 4),
+        mlp_layers=[400, 400, 400, 400],
     ):
         super(Decoder, self).__init__()
         self._shapes = shapes
@@ -480,15 +507,13 @@ class Decoder(nn.Module):
         self.mlp_keys = [
             k for k, v in shapes.items() if re.match(mlp_keys, k) and len(v) == 1
         ]
-        self.cnn_enc_shapes = cnn_enc_shapes
 
         if self.cnn_keys:
-            self.cnn_decoder = TransposedConvDecoder(
-                latent_dim, cnn_enc_shapes, enc_conv_kernels, act
-            )
+            out_channels = {k: self._shapes[k][-1] for k in self.cnn_keys}
+            self.cnn_decoder = ConvDecoder(latent_dim, cnn_depth, act, shape=(sum(out_channels.values()), 64, 64), kernels=cnn_kernels)
         if self.mlp_keys:
             state_dim = sum([self._shapes[k][-1] for k in self.mlp_keys])
-            mlp_hidden_layers = [latent_dim] + list(mlp_hidden_layers) + [state_dim]
+            mlp_hidden_layers = [latent_dim] + list(mlp_layers) + [state_dim]
             self.mlp_decoder = MLP(mlp_hidden_layers, act, norm)
 
     def forward(self, features):
@@ -516,7 +541,52 @@ class Decoder(nn.Module):
         return dists
 
 
-class TransposedConvDecoder(nn.Module):
+class ConvDecoder(nn.Module):
+    def __init__(
+        self,
+        inp_depth,
+        depth=32,
+        act='ELU',
+        shape=(3, 64, 64),
+        kernels=(5, 5, 6, 6),
+    ):
+        super(ConvDecoder, self).__init__()
+        self._inp_depth = inp_depth
+        self._act = get_act(act)
+        self._depth = depth
+        self._shape = shape
+        self._kernels = kernels
+
+        self._linear_layer = nn.Linear(inp_depth, 32 * self._depth)
+        inp_dim = 32 * self._depth
+
+        cnnt_layers = []
+        for i, kernel in enumerate(self._kernels):
+            depth = 2 ** (len(self._kernels) - i - 2) * self._depth
+            act = self._act
+            if i == len(self._kernels) - 1:
+                # depth = self._shape[-1]
+                depth = self._shape[0]
+                act = None
+            if i != 0:
+                inp_dim = 2 ** (len(self._kernels) - (i - 1) - 2) * self._depth
+            cnnt_layers.append(nn.ConvTranspose2d(inp_dim, depth, kernel, 2))
+            print((inp_dim, depth, kernel, 2))
+            if act is not None:
+                cnnt_layers.append(act())
+        self._cnnt_layers = nn.Sequential(*cnnt_layers)
+
+    def forward(self, features):
+        x = self._linear_layer(features)
+        x = x.reshape([-1, 1, 1, 32 * self._depth])
+        x = x.permute(0, 3, 1, 2)
+        x = self._cnnt_layers(x)
+        mean = x.reshape(features.shape[:-1] + self._shape)
+        mean = mean.permute(0, 1, 3, 4, 2)
+        return mean
+
+
+class TConvDecoder(nn.Module):
     def __init__(
         self,
         latent_dim: int,
@@ -524,7 +594,7 @@ class TransposedConvDecoder(nn.Module):
         enc_conv_kernels: Sequence[int],
         act: str = "none",
     ):
-        super(TransposedConvDecoder, self).__init__()
+        super(TConvDecoder, self).__init__()
         self._act = get_act(act)
         self._linear_layer = nn.Linear(
             latent_dim, functools.reduce(lambda a, b: a * b, enc_conv_output_sizes[-1])
@@ -541,6 +611,10 @@ class TransposedConvDecoder(nn.Module):
                     2,
                 )
             )
+            print(self._tconv_output_shapes[i][0],
+                    self._tconv_output_shapes[i + 1][0],
+                    self._tconv_kernels[i],
+                    2,)
             if i != len(self._tconv_output_shapes) - 2:
                 layers.append(self._act())
         self.layers = nn.Sequential(*layers)
@@ -707,7 +781,7 @@ class DistLayer(nn.Module):
             mean, std = torch.split(x, [self._out_size] * 2, -1)
             mean = torch.tanh(mean)
             std = 2 * torch.sigmoid(std / 2) + self._min_std
-            dist = SafeTruncatedNormal(mean, std, -1, 1)
+            dist = TruncNormalDist(mean, std, -1, 1)
             dist = ContDist(td.Independent(dist, 1))
         elif self._dist == "onehot":
             x = self._dist_layer(x)
@@ -716,6 +790,12 @@ class DistLayer(nn.Module):
             x = self._dist_layer(x)
             temp = self._temp
             dist = ContDist(td.gumbel.Gumbel(x, 1 / temp))
+        elif self._dist == "binary":
+            return Bernoulli(
+                td.independent.Independent(
+                    td.bernoulli.Bernoulli(logits=mean), len(self._shape)
+                )
+            )
         else:
             raise NotImplementedError(self._dist)
         return dist

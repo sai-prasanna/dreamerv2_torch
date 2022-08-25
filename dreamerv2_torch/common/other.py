@@ -31,6 +31,72 @@ class RandomAgent:
         return output, None
 
 
+def static_scan_for_lambda_return(fn, inputs, start):
+    last = start
+    indices = range(inputs[0].shape[0])
+    indices = reversed(indices)
+    flag = True
+    for index in indices:
+        inp = lambda x: (_input[x] for _input in inputs)
+        last = fn(last, *inp(index))
+        if flag:
+            outputs = last
+            flag = False
+        else:
+            outputs = torch.cat([outputs, last], dim=-1)
+    outputs = torch.reshape(outputs, [outputs.shape[0], outputs.shape[1], 1])
+    outputs = torch.unbind(outputs, dim=0)
+    outputs = torch.stack(outputs, dim=1)
+    return outputs
+
+
+def static_scan(fn, inputs, start):
+    last = start
+    indices = range(inputs[0].shape[0])
+    flag = True
+    for index in indices:
+        inp = lambda x: (_input[x] for _input in inputs)
+        last = fn(last, *inp(index))
+        if flag:
+            if type(last) == type({}):
+                outputs = {
+                    key: value.clone().unsqueeze(0) for key, value in last.items()
+                }
+            else:
+                outputs = []
+                for _last in last:
+                    if type(_last) == type({}):
+                        outputs.append(
+                            {
+                                key: value.clone().unsqueeze(0)
+                                for key, value in _last.items()
+                            }
+                        )
+                    else:
+                        outputs.append(_last.clone().unsqueeze(0))
+            flag = False
+        else:
+            if type(last) == type({}):
+                for key in last.keys():
+                    outputs[key] = torch.cat(
+                        [outputs[key], last[key].unsqueeze(0)], dim=0
+                    )
+            else:
+                for j in range(len(outputs)):
+                    if type(last[j]) == type({}):
+                        for key in last[j].keys():
+                            outputs[j][key] = torch.cat(
+                                [outputs[j][key], last[j][key].unsqueeze(0)], dim=0
+                            )
+                    else:
+                        outputs[j] = torch.cat(
+                            [outputs[j], last[j].unsqueeze(0)], dim=0
+                        )
+    if type(last) == type({}):
+        outputs = [outputs]
+    return outputs
+
+
 def schedule(string, step):
     try:
         return float(string)
@@ -59,21 +125,31 @@ def schedule(string, step):
         raise NotImplementedError(string)
 
 
-def lambda_return(reward, value, weights, bootstrap, lambda_):
-    def agg_fn(x, y):
-        return y[0] + y[1] * lambda_ * x
-
-    next_values = torch.cat([value[1:], bootstrap[None]], dim=0)
-    inputs = reward + weights * next_values * (1 - lambda_)
-
-    last = bootstrap
-    returns = []
-    for i in reversed(range(len(inputs))):
-        last = agg_fn(last, [inputs[i], weights[i]])
-        returns.append(last)
-
-    returns = list(reversed(returns))
-    returns = torch.stack(returns, dim=0)
+def lambda_return(reward, value, pcont, bootstrap, lambda_, axis):
+    # Setting lambda=1 gives a discounted Monte Carlo return.
+    # Setting lambda=0 gives a fixed 1-step return.
+    assert len(reward.shape) == len(value.shape), (reward.shape, value.shape)
+    if isinstance(pcont, (int, float)):
+        pcont = pcont * torch.ones_like(reward)
+    dims = list(range(len(reward.shape)))
+    dims = [axis] + dims[1:axis] + [0] + dims[axis + 1 :]
+    if axis != 0:
+        reward = reward.permute(dims)
+        value = value.permute(dims)
+        pcont = pcont.permute(dims)
+    if bootstrap is None:
+        bootstrap = torch.zeros_like(value[-1])
+    next_values = torch.cat([value[1:], bootstrap[None]], 0)
+    inputs = reward + pcont * next_values * (1 - lambda_)
+    # returns = static_scan(
+    #    lambda agg, cur0, cur1: cur0 + cur1 * lambda_ * agg,
+    #    (inputs, pcont), bootstrap, reverse=True)
+    # reimplement to optimize performance
+    returns = static_scan_for_lambda_return(
+        lambda agg, cur0, cur1: cur0 + cur1 * lambda_ * agg, (inputs, pcont), bootstrap
+    )
+    if axis != 0:
+        returns = returns.permute(dims)
     return returns
 
 
@@ -179,6 +255,7 @@ class CarryOverState:
     def __call__(self, *args):
         self._state, out = self._fn(*args, self._state)
         return out
+
 
 def to_np(x: torch.Tensor):
     return x.detach().cpu()

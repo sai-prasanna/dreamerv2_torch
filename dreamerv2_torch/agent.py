@@ -7,8 +7,9 @@ from torch import Tensor
 import common
 import expl
 
+
 class Agent(nn.Module):
-    def __init__(self, config, obs_space, act_space, step):
+    def __init__(self, config, obs_space, act_space, step: common.Counter):
         super().__init__()
         self.config = config
         self.obs_space = obs_space
@@ -16,7 +17,9 @@ class Agent(nn.Module):
         self.step = step
         self.tfstep = nn.Parameter(torch.ones(()) * int(self.step), requires_grad=False)
         self.wm = WorldModel(config, obs_space, self.act_space, self.tfstep)
-        self._task_behavior = ActorCritic(config, self.act_space, self.tfstep)
+        self._task_behavior = ActorCritic(
+            config, self.wm.rssm.state_dim, self.act_space, self.tfstep
+        )
         if config.expl_behavior == "greedy":
             self._expl_behavior = self._task_behavior
         else:
@@ -33,7 +36,9 @@ class Agent(nn.Module):
         self.tfstep.copy_(torch.tensor([int(self.step)])[0])
         if state is None:
             latent = self.wm.rssm.initial(len(obs["reward"]))
-            action = torch.zeros((len(obs["reward"]),) + self.act_space.shape).to(obs["reward"].device)
+            action = torch.zeros((len(obs["reward"]),) + self.act_space.shape).to(
+                obs["reward"].device
+            )
             state = latent, action
         latent, action = state
         embed = self.wm.encoder(obs)
@@ -41,7 +46,7 @@ class Agent(nn.Module):
         latent, _ = self.wm.rssm.obs_step(
             latent, action, embed, obs["is_first"], sample
         )
-        feat = self.wm.rssm.get_feature(latent)
+        feat = self.wm.rssm.get_feat(latent)
         if mode == "eval":
             actor = self._task_behavior.actor(feat)
             action = actor.mode()
@@ -54,9 +59,7 @@ class Agent(nn.Module):
             actor = self._task_behavior.actor(feat)
             action = actor.sample()
             noise = self.config.expl_noise
-        action = action.detach()
         action = common.action_noise(action, noise, self.act_space)
-        latent = {k: v.detach() for k, v in latent.items()}
         outputs = {"action": action}
         state = (latent, action)
         return outputs, state
@@ -98,16 +101,21 @@ class WorldModel(nn.Module):
             self.action_size, self.encoder.embed_size, **config.rssm
         )
         self.heads = {}
+        # self.heads["decoder"] = common.Decoder(
+        #     shapes,
+        #     self.rssm.state_dim,
+        #     self.encoder.cnn_output_shapes,
+        #     config.encoder.cnn_kernels,
+        #     config.encoder.mlp_layers,
+        #     config.encoder.act,
+        #     config.encoder.norm,
+        #     config.encoder.cnn_keys,
+        #     config.encoder.mlp_keys,
+        # )
         self.heads["decoder"] = common.Decoder(
-            shapes,
-            self.rssm.state_dim,
-            self.encoder.cnn_output_shapes,
-            config.encoder.cnn_kernels,
-            config.encoder.mlp_layers,
-            config.encoder.act,
-            config.encoder.norm,
-            config.encoder.cnn_keys,
-            config.encoder.mlp_keys,
+            shapes=shapes,
+            latent_dim=self.rssm.state_dim,
+            **config.decoder
         )
         self.heads["reward"] = common.MLPDistribution(
             self.rssm.state_dim, 1, **config.reward_head
@@ -121,7 +129,12 @@ class WorldModel(nn.Module):
             assert name in self.heads, name
         self.heads = nn.ModuleDict(self.heads)
         self.model_opt = common.Optimizer(
-            "model", self.parameters(), **config.model_opt, use_amp=self._use_amp 
+            "model",
+            list(self.encoder.parameters())
+            + list(self.rssm.parameters())
+            + list(self.heads.parameters()),
+            **config.model_opt,
+            use_amp=self._use_amp,
         )
 
     def train(self, data, state=None):
@@ -139,7 +152,7 @@ class WorldModel(nn.Module):
         assert len(kl_loss.shape) == 0
         likes = {}
         losses = {"kl": kl_loss}
-        feat = self.rssm.get_feature(post)
+        feat = self.rssm.get_feat(post)
         for name, head in self.heads.items():
             grad_head = name in self.config.grad_heads
             inp = feat if grad_head else feat.detach()
@@ -154,12 +167,19 @@ class WorldModel(nn.Module):
         )
         detach_dict = lambda x: {k: v.detach() for k, v in x.items()}
         outs = dict(
-            embed=embed, feat=feat, post=detach_dict(post), prior=prior, likes=likes, kl=kl_value
+            embed=embed.detach(),
+            feat=feat.detach(),
+            post=detach_dict(post),
+            prior=detach_dict(prior),
+            likes=detach_dict(likes),
+            kl=kl_value.detach(),
         )
-        metrics = {f"{name}_loss": value.detach().cpu() for name, value in losses.items()}
+        metrics = {
+            f"{name}_loss": value.detach().cpu() for name, value in losses.items()
+        }
         metrics["model_kl"] = kl_value.mean().detach().cpu()
-        metrics["prior_ent"] = self.rssm._get_dist(prior).entropy().mean().detach().cpu()
-        metrics["post_ent"] = self.rssm._get_dist(post).entropy().mean().detach().cpu()
+        metrics["prior_ent"] = self.rssm.get_dist(prior).entropy().mean().detach().cpu()
+        metrics["post_ent"] = self.rssm.get_dist(post).entropy().mean().detach().cpu()
         last_state = {k: v[:, -1].detach() for k, v in post.items()}
         return model_loss, last_state, outs, metrics
 
@@ -173,13 +193,13 @@ class WorldModel(nn.Module):
         """Given a batch of states, rolls out more state of length horizon."""
         flatten = lambda x: x.reshape([-1] + list(x.shape[2:]))
         start = {k: flatten(v) for k, v in start_state.items()}
-        start["feat"] = self.rssm.get_feature(start)
+        start["feat"] = self.rssm.get_feat(start)
         start["action"] = torch.zeros_like(policy(start["feat"]).mode())
         seq = {k: [v] for k, v in start.items()}
         for _ in range(horizon):
-            action = policy(seq["feat"][-1].detach()).rsample()
+            action = policy(seq["feat"][-1].detach()).sample()
             state = self.rssm.img_step({k: v[-1] for k, v in seq.items()}, action)
-            feature = self.rssm.get_feature(state)
+            feature = self.rssm.get_feat(state)
             for key, value in {**state, "action": action, "feat": feature}.items():
                 seq[key].append(value)
 
@@ -196,29 +216,32 @@ class WorldModel(nn.Module):
                 seq["feat"].shape[:-1], device=seq["feat"].device
             )
         seq["discount"] = disc.unsqueeze(-1)
-        seq["weight"] = torch.cumprod(
-            torch.cat([torch.ones_like(disc[:1]), disc[:-1]], 0), 0
-        ).unsqueeze(-1).detach()
+        seq["weight"] = (
+            torch.cumprod(torch.cat([torch.ones_like(disc[:1]), disc[:-1]], 0), 0)
+            .unsqueeze(-1)
+            .detach()
+        )
         return seq
 
     def preprocess(self, obs):
-        #dtype = torch.float16 if self.config.precision == 16 else torch.float32
         obs = obs.copy()
+        dtype = torch.float32
         obs = {k: torch.Tensor(v).to(self.config.device) for k, v in obs.items()}
         for key, value in obs.items():
             if key.startswith("log_"):
                 continue
             if value.dtype == torch.int32:
-                value = value#.to(dtype)
+                value = value.to(dtype)
             if value.dtype == torch.uint8:
-                value = value / 255.0 - 0.5 # value.to(dtype) / 255.0 - 0.5
+                value = value.to(dtype) / 255.0 - 0.5
+            value = value.to(dtype)
             obs[key] = value
         obs["reward"] = {
             "identity": lambda x: x,
             "sign": torch.sign,
             "tanh": torch.tanh,
         }[self.config.clip_rewards](obs["reward"]).unsqueeze(-1)
-        obs["discount"] = 1.0 - obs["is_terminal"].float().unsqueeze(-1)#.to(dtype)
+        obs["discount"] = 1.0 - obs["is_terminal"].float().unsqueeze(-1)  # .to(dtype)
         obs["discount"] *= self.config.discount
         return obs
 
@@ -229,10 +252,10 @@ class WorldModel(nn.Module):
         states, _ = self.rssm.observe(
             embed[:6, :5], data["action"][:6, :5], data["is_first"][:6, :5]
         )
-        recon = decoder(self.rssm.get_feature(states))[key].mode()[:6]
+        recon = decoder(self.rssm.get_feat(states))[key].mode()[:6]
         init = {k: v[:, -1] for k, v in states.items()}
         prior = self.rssm.imagine(data["action"][:6, 5:], init)
-        openl = decoder(self.rssm.get_feature(prior))[key].mode()
+        openl = decoder(self.rssm.get_feat(prior))[key].mode()
         model = torch.concat([recon[:, :5] + 0.5, openl + 0.5], 1)
         error = (model - truth + 1) / 2
         video = torch.concat([truth, model, error], 2)
@@ -241,7 +264,7 @@ class WorldModel(nn.Module):
 
 
 class ActorCritic(nn.Module):
-    def __init__(self, config, act_space, tfstep):
+    def __init__(self, config, state_dim, act_space, tfstep):
         super().__init__()
         self.config = config
         self._use_amp = True if config.precision == 16 else False
@@ -256,26 +279,28 @@ class ActorCritic(nn.Module):
             self.config = self.config.update(
                 {"actor_grad": "reinforce" if discrete else "dynamics"}
             )
-        if config.rssm.discrete:
-            feat_size = config.rssm.stoch * config.rssm.discrete + config.rssm.deter
-        else:
-            feat_size = config.rssm.stoch + config.rssm.deter
         self.actor = common.MLPDistribution(
-            feat_size, act_space.shape[0], **self.config.actor
+            state_dim, act_space.shape[0], **self.config.actor
         )
-        self.critic = common.MLPDistribution(feat_size, 1, **self.config.critic)
+        self.critic = common.MLPDistribution(state_dim, 1, **self.config.critic)
         if self.config.slow_target:
             self._target_critic = common.MLPDistribution(
-                feat_size, 1, **self.config.critic
+                state_dim, 1, **self.config.critic
             )
             self._updates = nn.Parameter(torch.zeros(()), requires_grad=False)
         else:
             self._target_critic = self.critic
         self.actor_opt = common.Optimizer(
-            "actor", self.actor.parameters(), use_amp=self._use_amp, **self.config.actor_opt
+            "actor",
+            self.actor.parameters(),
+            use_amp=self._use_amp,
+            **self.config.actor_opt,
         )
         self.critic_opt = common.Optimizer(
-            "critic", self.critic.parameters(), use_amp=self._use_amp, **self.config.critic_opt
+            "critic",
+            self.critic.parameters(),
+            use_amp=self._use_amp,
+            **self.config.critic_opt,
         )
         self.rewnorm = common.StreamNorm(**self.config.reward_norm)
 
@@ -298,7 +323,7 @@ class ActorCritic(nn.Module):
         with common.RequiresGrad(self.critic):
             with torch.cuda.amp.autocast(self._use_amp):
                 critic_loss, mets4 = self.critic_loss(seq, target)
-        with common.RequiresGrad(self):
+        with common.RequiresGrad(self.actor), common.RequiresGrad(self.critic):
             metrics.update(self.actor_opt(actor_loss))
             metrics.update(self.critic_opt(critic_loss))
         metrics.update(**mets1, **mets2, **mets3, **mets4)
@@ -376,6 +401,7 @@ class ActorCritic(nn.Module):
             disc[:-1],
             bootstrap=value[-1],
             lambda_=self.config.discount_lambda,
+            axis=0,
         )
         metrics = {}
         metrics["critic_slow"] = value.mean().detach().cpu()

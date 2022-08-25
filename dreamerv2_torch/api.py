@@ -89,12 +89,13 @@ def train(env, config, outputs=None):
         driver.reset()
 
     print("Create agent.")
-    agnt = agent.Agent(config, env.obs_space, env.act_space, step)
+    agnt = agent.Agent(config, env.obs_space, env.act_space, step).to(config.device)
+    agnt.requires_grad_(False)
     dataset = iter(replay.dataset(**config.dataset))
     train_agent = common.CarryOverState(agnt.train)
     train_agent(next(dataset))
-    if (logdir / "variables.pkl").exists():
-        agnt.load_state_dict(torch.load(logdir / "variables.pkl"))
+    if (logdir / "model.pt").exists():
+        agnt.load_state_dict(torch.load(logdir / "model.pt"))
     else:
         print("Pretrain agent.")
         for _ in range(config.pretrain):
@@ -120,4 +121,4 @@ def train(env, config, outputs=None):
     while step < config.steps:
         logger.write()
         driver(policy, steps=config.eval_every)
-        torch.save(agent.state_dict(), logdir / "variables.pkl")
+        torch.save(agnt.state_dict(), logdir / "model.pt")
