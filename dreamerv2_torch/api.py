@@ -91,6 +91,19 @@ def train(env, config, outputs=None):
     print("Create agent.")
     agnt = agent.Agent(config, env.obs_space, env.act_space, step).to(config.device)
     agnt.requires_grad_(False)
+    agnt = agent.Agent(config, env.obs_space, env.act_space, step)
+    agnt.initialize_lazy_modules(next(dataset))
+    print(
+        f"Number of parameters in WorldModel {sum(p.numel() for p in agnt.wm.parameters())}"
+    )
+    print(
+        f"Number of parameters in Actor {sum(p.numel() for p in agnt._task_behavior.actor.parameters())}"
+    )
+    print(
+        f"Number of parameters in Critic {sum(p.numel() for p in agnt._task_behavior.critic.parameters())}"
+    )
+    agnt.requires_grad_(False)
+    agnt = agnt.to(config.device)
     dataset = iter(replay.dataset(**config.dataset))
     train_agent = common.CarryOverState(agnt.train)
     train_agent(next(dataset))

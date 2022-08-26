@@ -7,6 +7,18 @@ import torch
 import torch.nn as nn
 
 
+class Module(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self._lazy_modules = nn.ModuleDict({})
+
+    def get(self, name, ctor, *args, **kwargs):
+        # Create or get layer by name to avoid mentioning it in the constructor.
+        if name not in self._lazy_modules:
+            self._lazy_modules[name] = ctor(*args, **kwargs)
+        return self._lazy_modules[name]
+
+
 class Optimizer:
     def __init__(
         self,

@@ -108,20 +108,25 @@ class ModelLoss(nn.Module):
         self.wm = wm
         self.ac = agent.ActorCritic(config, act_space, tfstep)
         self.actor = self.ac.actor
-        self.head = common.MLP([], **self.config.expl_head)
+        self.head = common.MLP(1, **self.config.expl_head)
+
+    def initialize_optimizer(self):
         self.opt = common.Optimizer("expl", self.head, **self.config.expl_opt)
 
     def train(self, start, context, data):
         metrics = {}
-        target = context[self.config.expl_model_loss].to(torch.float32)
         with common.RequiresGrad(self.head):
             with torch.cuda.amp.autocast(self._use_amp):
-                loss = -self.head(context["feat"]).log_prob(target).mean()
+                loss = self.loss(context)
             metrics.update(self.opt(loss))
         metrics.update(
             self.ac.train(self.wm, start, data["is_terminal"], self._intr_reward)
         )
         return None, metrics
+
+    def loss(self, context):
+        target = context[self.config.expl_model_loss].to(torch.float32)
+        return -self.head(context["feat"]).log_prob(target).mean()
 
     def _intr_reward(self, seq):
         reward = self.config.expl_intr_scale * self.head(seq["feat"]).mode()

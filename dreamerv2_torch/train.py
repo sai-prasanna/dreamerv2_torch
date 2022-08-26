@@ -155,11 +155,19 @@ def main():
     report_dataset = iter(train_replay.dataset(**config.dataset))
     eval_dataset = iter(eval_replay.dataset(**config.dataset))
 
-    agnt = agent.Agent(config, obs_space, act_space, step).to(config.device)
-    print(f"Number of parameters in WorldModel {sum(p.numel() for p in agnt.wm.parameters() if p.requires_grad)}")
-    print(f"Number of parameters in Actor {sum(p.numel() for p in agnt._task_behavior.actor.parameters() if p.requires_grad)}")
-    print(f"Number of parameters in Critic {sum(p.numel() for p in agnt._task_behavior.critic.parameters() if p.requires_grad)}")
+    agnt = agent.Agent(config, obs_space, act_space, step)
+    agnt.initialize_lazy_modules(next(train_dataset))
+    print(
+        f"Number of parameters in WorldModel {sum(p.numel() for p in agnt.wm.parameters())}"
+    )
+    print(
+        f"Number of parameters in Actor {sum(p.numel() for p in agnt._task_behavior.actor.parameters())}"
+    )
+    print(
+        f"Number of parameters in Critic {sum(p.numel() for p in agnt._task_behavior.critic.parameters())}"
+    )
     agnt.requires_grad_(False)
+    agnt = agnt.to(config.device)
     train_agent = common.CarryOverState(agnt.train)
     train_agent(next(train_dataset))
     if (logdir / "model.pt").exists():

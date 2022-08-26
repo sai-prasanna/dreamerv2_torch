@@ -16,10 +16,8 @@ class Agent(nn.Module):
         self.act_space = act_space["action"]
         self.step = step
         self.tfstep = nn.Parameter(torch.ones(()) * int(self.step), requires_grad=False)
-        self.wm = WorldModel(config, obs_space, self.act_space, self.tfstep)
-        self._task_behavior = ActorCritic(
-            config, self.wm.rssm.state_dim, self.act_space, self.tfstep
-        )
+        self.wm = WorldModel(config, obs_space, self.tfstep)
+        self._task_behavior = ActorCritic(config, self.act_space, self.tfstep)
         if config.expl_behavior == "greedy":
             self._expl_behavior = self._task_behavior
         else:
@@ -86,21 +84,29 @@ class Agent(nn.Module):
             report[f"openl_{name}"] = self.wm.video_pred(data, key)
         return report
 
+    def initialize_lazy_modules(self, data):
+        _, _, outputs, _ = self.wm.loss(data, None)
+        start = outputs["post"]
+        reward = lambda seq: self.wm.heads["reward"](seq["feat"]).mode()
+        self._task_behavior.loss(self.wm, start, data["is_terminal"], reward)
+        if self.config.expl_behavior != "greedy":
+            self._expl_behavior.loss(outputs)
+        self.zero_grad()
+        self.wm.initialize_optimizer()
+        self._task_behavior.initialize_optimizer()
 
-class WorldModel(nn.Module):
-    def __init__(self, config, obs_space, action_space, tfstep):
+
+class WorldModel(common.Module):
+    def __init__(self, config, obs_space, tfstep):
         super().__init__()
         self._use_amp = True if config.precision == 16 else False
-        self.action_size = action_space.shape[0]
         shapes = {k: tuple(v.shape) for k, v in obs_space.items()}
         self.config = config
         self.tfstep = tfstep
-        self.encoder = common.Encoder(shapes, **config.encoder)
 
-        self.rssm = common.EnsembleRSSM(
-            self.action_size, self.encoder.embed_size, **config.rssm
-        )
-        self.heads = {}
+        self.rssm = common.EnsembleRSSM(**config.rssm)
+        self.encoder = common.Encoder(shapes, **config.encoder)
+        self.heads = nn.ModuleDict({})
         # self.heads["decoder"] = common.Decoder(
         #     shapes,
         #     self.rssm.state_dim,
@@ -112,28 +118,21 @@ class WorldModel(nn.Module):
         #     config.encoder.cnn_keys,
         #     config.encoder.mlp_keys,
         # )
-        self.heads["decoder"] = common.Decoder(
-            shapes=shapes,
-            latent_dim=self.rssm.state_dim,
-            **config.decoder
-        )
-        self.heads["reward"] = common.MLPDistribution(
-            self.rssm.state_dim, 1, **config.reward_head
-        )
+        self.heads["decoder"] = common.Decoder(shapes=shapes, **config.decoder)
+        self.heads["reward"] = common.MLP(1, **config.reward_head)
 
         if config.pred_discount:
-            self.heads["discount"] = common.MLPDistribution(
-                self.rssm.state_dim, 1, **config.discount_head
-            )
+            self.heads["discount"] = common.MLP(1, **config.discount_head)
         for name in config.grad_heads:
             assert name in self.heads, name
-        self.heads = nn.ModuleDict(self.heads)
+
+    def initialize_optimizer(self):
         self.model_opt = common.Optimizer(
             "model",
             list(self.encoder.parameters())
             + list(self.rssm.parameters())
             + list(self.heads.parameters()),
-            **config.model_opt,
+            **self.config.model_opt,
             use_amp=self._use_amp,
         )
 
@@ -226,7 +225,10 @@ class WorldModel(nn.Module):
     def preprocess(self, obs):
         obs = obs.copy()
         dtype = torch.float32
-        obs = {k: torch.Tensor(v).to(self.config.device) for k, v in obs.items()}
+        obs = {
+            k: torch.Tensor(v).to(next(self.parameters()).device)
+            for k, v in obs.items()
+        }
         for key, value in obs.items():
             if key.startswith("log_"):
                 continue
@@ -264,7 +266,7 @@ class WorldModel(nn.Module):
 
 
 class ActorCritic(nn.Module):
-    def __init__(self, config, state_dim, act_space, tfstep):
+    def __init__(self, config, act_space, tfstep):
         super().__init__()
         self.config = config
         self._use_amp = True if config.precision == 16 else False
@@ -279,17 +281,18 @@ class ActorCritic(nn.Module):
             self.config = self.config.update(
                 {"actor_grad": "reinforce" if discrete else "dynamics"}
             )
-        self.actor = common.MLPDistribution(
-            state_dim, act_space.shape[0], **self.config.actor
-        )
-        self.critic = common.MLPDistribution(state_dim, 1, **self.config.critic)
+        self.actor = common.MLP(int(act_space.shape[0]), **self.config.actor)
+        self.critic = common.MLP(1, **self.config.critic)
         if self.config.slow_target:
-            self._target_critic = common.MLPDistribution(
-                state_dim, 1, **self.config.critic
+            self._target_critic = common.MLP(1, **self.config.critic)
+            self._updates = nn.Parameter(
+                torch.zeros((), dtype=torch.int64), requires_grad=False
             )
-            self._updates = nn.Parameter(torch.zeros(()), requires_grad=False)
         else:
             self._target_critic = self.critic
+        self.rewnorm = common.StreamNorm(**self.config.reward_norm)
+
+    def initialize_optimizer(self):
         self.actor_opt = common.Optimizer(
             "actor",
             self.actor.parameters(),
@@ -302,9 +305,18 @@ class ActorCritic(nn.Module):
             use_amp=self._use_amp,
             **self.config.critic_opt,
         )
-        self.rewnorm = common.StreamNorm(**self.config.reward_norm)
 
     def train(self, world_model: WorldModel, start, is_terminal, reward_fn):
+        actor_loss, critic_loss, metrics = self.loss(
+            world_model, start, is_terminal, reward_fn
+        )
+        with common.RequiresGrad(self.actor), common.RequiresGrad(self.critic):
+            metrics.update(self.actor_opt(actor_loss))
+            metrics.update(self.critic_opt(critic_loss))
+        self.update_slow_target()  # Variables exist after first forward pass.
+        return metrics
+
+    def loss(self, world_model, start, is_terminal, reward_fn):
         metrics = {}
         hor = self.config.imag_horizon
         # The weights are is_terminal flags for the imagination start states.
@@ -323,12 +335,8 @@ class ActorCritic(nn.Module):
         with common.RequiresGrad(self.critic):
             with torch.cuda.amp.autocast(self._use_amp):
                 critic_loss, mets4 = self.critic_loss(seq, target)
-        with common.RequiresGrad(self.actor), common.RequiresGrad(self.critic):
-            metrics.update(self.actor_opt(actor_loss))
-            metrics.update(self.critic_opt(critic_loss))
         metrics.update(**mets1, **mets2, **mets3, **mets4)
-        self.update_slow_target()  # Variables exist after first forward pass.
-        return metrics
+        return actor_loss, critic_loss, metrics
 
     def actor_loss(self, seq, target):
         # Actions:      0   [a1]  [a2]   a3
