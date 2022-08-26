@@ -1,5 +1,5 @@
 
-# WIP: Mastering Atari with Discrete World Models Itorch)
+# WIP: Mastering Atari with Discrete World Models (Pytorch)
 
 Implementation of the [DreamerV2][website] agent in pytorch. It mirrors the original [tensorflow implementaition](https://github.com/danijar/dreamerv2) in it's structure for the most part. We use major parts of [dreamer-torch](https://github.com/jsikyoon/dreamer-torch) implementation. It's a Work-In-Progress, unable to coverge to the same performance as the tensorflow implementation yet.
 
