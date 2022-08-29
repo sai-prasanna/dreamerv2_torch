@@ -451,7 +451,7 @@ class NormLayer(nn.Module):
         else:
             raise NotImplementedError(name)
 
-    def __call__(self, features):
+    def forward(self, features):
         if not self._layer:
             return features
         return self._layer(features)

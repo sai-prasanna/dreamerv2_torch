@@ -158,7 +158,7 @@ class WorldModel(common.Module):
             out = head(inp)
             dists = out if isinstance(out, dict) else {name: out}
             for key, dist in dists.items():
-                like = dist.log_prob(data[key]).to(torch.float32)
+                like = dist.log_prob(data[key])
                 likes[key] = like
                 losses[key] = -like.mean()
         model_loss = sum(
@@ -207,6 +207,8 @@ class WorldModel(common.Module):
         if "discount" in self.heads:
             disc = self.heads["discount"](seq["feat"]).mean()
             if is_terminal is not None:
+                # Override discount prediction for the first step with the true
+                # discount factor from the replay buffer.
                 true_first = 1.0 - flatten(is_terminal).astype(disc.dtype)
                 true_first *= self.config.discount
                 disc = torch.concat([true_first[None], disc[1:]], 0)
@@ -215,6 +217,8 @@ class WorldModel(common.Module):
                 seq["feat"].shape[:-1], device=seq["feat"].device
             )
         seq["discount"] = disc.unsqueeze(-1)
+        # Shift discount factors because they imply whether the following state
+        # will be valid, not whether the current state is valid.
         seq["weight"] = (
             torch.cumprod(torch.cat([torch.ones_like(disc[:1]), disc[:-1]], 0), 0)
             .unsqueeze(-1)
@@ -310,9 +314,10 @@ class ActorCritic(nn.Module):
         actor_loss, critic_loss, metrics = self.loss(
             world_model, start, is_terminal, reward_fn
         )
-        with common.RequiresGrad(self.actor), common.RequiresGrad(self.critic):
-            metrics.update(self.actor_opt(actor_loss))
-            metrics.update(self.critic_opt(critic_loss))
+        with common.RequiresGrad(self.actor):
+            metrics.update(self.actor_opt(actor_loss, self.actor.parameters()))
+        with common.RequiresGrad(self.critic):
+            metrics.update(self.critic_opt(critic_loss, self.critic.parameters()))
         self.update_slow_target()  # Variables exist after first forward pass.
         return metrics
 
@@ -399,8 +404,8 @@ class ActorCritic(nn.Module):
         # Values:     [v0]  [v1]  [v2]  [v3]
         # Discount:   [d0]  [d1]  [d2]   d3
         # Targets:     t0    t1    t2
-        reward = seq["reward"].to(torch.float32)
-        disc = seq["discount"].to(torch.float32)
+        reward = seq["reward"]
+        disc = seq["discount"]
         value = self._target_critic(seq["feat"]).mode()
         # Skipping last time step because it is used for bootstrapping.
         target = common.lambda_return(
