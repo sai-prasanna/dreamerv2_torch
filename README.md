@@ -1,7 +1,7 @@
 
-# WIP: Mastering Atari with Discrete World Models (Pytorch)
+# Mastering Atari with Discrete World Models (Pytorch)
 
-Implementation of the [DreamerV2][website] agent in pytorch. It mirrors the original [tensorflow implementaition](https://github.com/danijar/dreamerv2) in it's structure for the most part. We use major parts of [dreamer-torch](https://github.com/jsikyoon/dreamer-torch) implementation. It's a Work-In-Progress, unable to coverge to the same performance as the tensorflow implementation yet.
+Implementation of the [DreamerV2][website] agent in pytorch. It mirrors the original [tensorflow implementaition](https://github.com/danijar/dreamerv2) in it's structure for the most part. We use major parts of [dreamer-torch](https://github.com/jsikyoon/dreamer-torch) implementation. It reaches similar performance curves for few environments I tested for 100k (cartpole, cheetah). Haven't tested Plan2Explore yet, but it's included.
 
 <p align="center">
 <img width="90%" src="https://imgur.com/gO1rvEn.gif">
@@ -15,6 +15,14 @@ If you find this code useful, please reference in your paper:
   author={Hafner, Danijar and Lillicrap, Timothy and Norouzi, Mohammad and Ba, Jimmy},
   journal={arXiv preprint arXiv:2010.02193},
   year={2020}
+}
+@misc{dreamerv2_torch,
+  author = {Sai Prasanna},
+  title = {Dreamerv2 Pytorch Implementation},
+  year = {2022},
+  publisher = {GitHub},
+  journal = {GitHub repository},
+  howpublished = {\url{https://github.com/sai-prasanna/dreamerv2_torch}},
 }
 ```
 
@@ -56,7 +64,7 @@ For more information:
 ## Using the Package
 
 The easiest way to run DreamerV2 on new environments is to install the package
-via `pip3 install dreamerv2`. The code automatically detects whether the
+via `pip3 install git+https://github.com/sai-prasanna/dreamerv2_torch.git`. The code automatically detects whether the
 environment uses discrete or continuous actions. Here is a usage example that
 trains DreamerV2 on the MiniGrid environment:
 
@@ -167,3 +175,12 @@ plotting script also stores the binned and aggregated metrics of multiple runs
 into a single JSON file for easy manual plotting.
 
 [mixed]: https://www.tensorflow.org/guide/mixed_precision
+
+## Differences with Dreamerv2 official
+
+For dmc_vision tasks, we set 
+`rssm: {hidden: 200, deter: 200, stoch: 50, discrete: 0}` as the rssm settings. 
+This makes the stochastic state space continous normal. The defaults in dreamerv2
+official chooses `rssm: {hidden: 200, deter: 200}` as the override, and leaves 
+the `stoch: 32, discrete: 32` of defaults untouched. This sets the stochastic state
+to be a set of 32 one hot distributions.
