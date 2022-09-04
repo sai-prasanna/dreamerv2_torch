@@ -21,7 +21,7 @@ defaults:
   train_steps: 1
   expl_until: 0
   replay: {capacity: 2e6, ongoing: False, minlen: 50, maxlen: 50, prioritize_ends: True}
-  dataset: {batch: 16, length: 50}
+  dataset: {batch: 50, length: 50}
   log_keys_video: ['image']
   log_keys_sum: '^$'
   log_keys_mean: '^$'

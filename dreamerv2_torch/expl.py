@@ -25,6 +25,7 @@ class Random(nn.Module):
 
 class Plan2Explore(nn.Module):
     def __init__(self, config, act_space, wm, tfstep, reward):
+        super().__init__()
         self.config = config
         self.reward = reward
         self.wm = wm
@@ -43,16 +44,26 @@ class Plan2Explore(nn.Module):
         self._networks = nn.ModuleList(
             [common.MLP(size, **config.expl_head) for _ in range(config.disag_models)]
         )
-        self.opt = common.Optimizer("expl", self._networks, **config.expl_opt)
         self.extr_rewnorm = common.StreamNorm(**self.config.expl_reward_norm)
         self.intr_rewnorm = common.StreamNorm(**self.config.expl_reward_norm)
 
-    def train(self, start, context, data):
-        metrics = {}
+    def lazy_initialize(self, start, context, data):
+        self.loss(start, context, data)
+        self.ac.loss(self.wm, start, data["is_terminal"], self._intr_reward)
+        self.initialize_optimizer()
+        self.ac.initialize_optimizer()
+
+    def initialize_optimizer(self):
+        self.opt = common.Optimizer(
+            "expl", self._networks.parameters(), **self.config.expl_opt
+        )
+
+    def loss(self, start, context, data):
+        data = self.wm.preprocess(data)
         stoch = start["stoch"]
         if self.config.rssm.discrete:
             stoch = torch.reshape(
-                stoch, stoch.shape[:-2] + (stoch.shape[-2] * stoch.shape[-1])
+                stoch, stoch.shape[:-2] + (stoch.shape[-2] * stoch.shape[-1],)
             )
         target = {
             "embed": context["embed"],
@@ -64,9 +75,17 @@ class Plan2Explore(nn.Module):
         if self.config.disag_action_cond:
             action = data["action"].to(inputs.dtype)
             inputs = torch.concat([inputs, action], -1)
-        metrics.update(self._train_ensemble(inputs, target))
+        loss = self._ensemble_loss(inputs, target)
+        return loss
+
+    def _train(self, start, context, data):
+        metrics = {}
+        with common.RequiresGrad(self._networks):
+            with torch.cuda.amp.autocast(self._use_amp):
+                loss = self.loss(start, context, data)
+            metrics.update(self.opt(loss))
         metrics.update(
-            self.ac.train(self.wm, start, data["is_terminal"], self._intr_reward)
+            self.ac._train(self.wm, start, data["is_terminal"], self._intr_reward)
         )
         return None, metrics
 
@@ -76,7 +95,7 @@ class Plan2Explore(nn.Module):
             action = seq["action"].to(inputs.dtype)
             inputs = torch.concat([inputs, action], -1)
         preds = [head(inputs).mode() for head in self._networks]
-        disag = torch.tensor(preds).std(0).mean(-1)
+        disag = torch.stack(preds, dim=0).std(0).mean(-1)
         if self.config.disag_log:
             disag = torch.log(disag)
         reward = self.config.expl_intr_scale * self.intr_rewnorm(disag)[0]
@@ -84,20 +103,17 @@ class Plan2Explore(nn.Module):
             reward += (
                 self.config.expl_extr_scale * self.extr_rewnorm(self.reward(seq))[0]
             )
-        return reward
+        return reward.unsqueeze(-1)
 
-    def _train_ensemble(self, inputs, targets):
+    def _ensemble_loss(self, inputs, targets):
         if self.config.disag_offset:
             targets = targets[:, self.config.disag_offset :]
             inputs = inputs[:, : -self.config.disag_offset]
         targets = targets.detach()
         inputs = inputs.detach()
-        with common.RequiresGrad(self._networks):
-            with torch.cuda.amp.autocast(self._use_amp):
-                preds = [head(inputs) for head in self._networks]
-                loss = -sum([pred.log_prob(targets).mean() for pred in preds])
-            metrics = self.opt(loss)
-        return metrics
+        preds = [head(inputs) for head in self._networks]
+        loss = -sum([pred.log_prob(targets).mean() for pred in preds])
+        return loss
 
 
 class ModelLoss(nn.Module):

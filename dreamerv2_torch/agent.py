@@ -15,7 +15,7 @@ class Agent(nn.Module):
         self.obs_space = obs_space
         self.act_space = act_space["action"]
         self.step = step
-        self.tfstep = nn.Parameter(torch.ones(()) * int(self.step), requires_grad=False)
+        self.register_buffer("tfstep", torch.ones(()) * int(self.step))
         self.wm = WorldModel(config, obs_space, self.tfstep)
         self._task_behavior = ActorCritic(config, self.act_space, self.tfstep)
         if config.expl_behavior == "greedy":
@@ -72,7 +72,7 @@ class Agent(nn.Module):
             self._task_behavior._train(self.wm, start, data["is_terminal"], reward)
         )
         if self.config.expl_behavior != "greedy":
-            mets = self._expl_behavior.train(start, outputs, data)[-1]
+            mets = self._expl_behavior._train(start, outputs, data)[-1]
             metrics.update({"expl_" + key: value for key, value in mets.items()})
         return state, metrics
 
@@ -90,7 +90,7 @@ class Agent(nn.Module):
         reward = lambda seq: self.wm.heads["reward"](seq["feat"]).mode()
         self._task_behavior.loss(self.wm, start, data["is_terminal"], reward)
         if self.config.expl_behavior != "greedy":
-            self._expl_behavior.loss(outputs)
+            self._expl_behavior.lazy_initialize(start, outputs, data)
         self.zero_grad()
         self.wm.initialize_optimizer()
         self._task_behavior.initialize_optimizer()

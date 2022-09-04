@@ -19,7 +19,7 @@ class Module(nn.Module):
         return self._lazy_modules[name]
 
 
-class Optimizer:
+class Optimizer(nn.Module):
     def __init__(
         self,
         name,
