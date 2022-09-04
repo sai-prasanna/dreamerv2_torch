@@ -203,8 +203,8 @@ class EnsembleRSSM(Module):
                 dist(rhs) if self._discrete else dist(rhs)._dist,
             )
             if free_avg:
-                loss_lhs = torch.maximum(torch.mean(value_lhs), torch.Tensor([free])[0])
-                loss_rhs = torch.maximum(torch.mean(value_rhs), torch.Tensor([free])[0])
+                loss_lhs = torch.maximum(value_lhs.mean(), torch.Tensor([free])[0])
+                loss_rhs = torch.maximum(value_rhs.mean(), torch.Tensor([free])[0])
             else:
                 loss_lhs = torch.maximum(value_lhs, torch.Tensor([free])[0]).mean()
                 loss_rhs = torch.maximum(value_rhs, torch.Tensor([free])[0]).mean()
@@ -434,7 +434,7 @@ class DistLayer(Module):
             return SampleDist(dist)
         if self._dist == "trunc_normal":
             std = 2 * torch.sigmoid((std + self._init_std) / 2) + self._min_std
-            dist = TruncNormalDist(torch.tanh(out), std, -1, 1)
+            dist = TruncatedNormal(torch.tanh(out), std, -1, 1)
             return ContDist(td.Independent(dist, 1))
         if self._dist == "onehot":
             return OneHotDist(out)

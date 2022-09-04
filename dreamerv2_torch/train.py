@@ -168,8 +168,7 @@ def main():
     )
     agnt.requires_grad_(False)
     agnt = agnt.to(config.device)
-    train_agent = common.CarryOverState(agnt.train)
-    train_agent(next(train_dataset))
+    train_agent = common.CarryOverState(agnt._train)
     if (logdir / "model.pt").exists():
         agnt.load_state_dict(torch.load(logdir / "model.pt"))
     else:

@@ -62,14 +62,14 @@ class Agent(nn.Module):
         state = (latent, action)
         return outputs, state
 
-    def train(self, data, state=None):
+    def _train(self, data, state=None):
         metrics = {}
-        state, outputs, mets = self.wm.train(data, state)
+        state, outputs, mets = self.wm._train(data, state)
         metrics.update(mets)
         start = outputs["post"]
         reward = lambda seq: self.wm.heads["reward"](seq["feat"]).mode()
         metrics.update(
-            self._task_behavior.train(self.wm, start, data["is_terminal"], reward)
+            self._task_behavior._train(self.wm, start, data["is_terminal"], reward)
         )
         if self.config.expl_behavior != "greedy":
             mets = self._expl_behavior.train(start, outputs, data)[-1]
@@ -106,18 +106,7 @@ class WorldModel(common.Module):
 
         self.rssm = common.EnsembleRSSM(**config.rssm)
         self.encoder = common.Encoder(shapes, **config.encoder)
-        self.heads = nn.ModuleDict({})
-        # self.heads["decoder"] = common.Decoder(
-        #     shapes,
-        #     self.rssm.state_dim,
-        #     self.encoder.cnn_output_shapes,
-        #     config.encoder.cnn_kernels,
-        #     config.encoder.mlp_layers,
-        #     config.encoder.act,
-        #     config.encoder.norm,
-        #     config.encoder.cnn_keys,
-        #     config.encoder.mlp_keys,
-        # )
+        self.heads = nn.ModuleDict()
         self.heads["decoder"] = common.Decoder(shapes=shapes, **config.decoder)
         self.heads["reward"] = common.MLP(1, **config.reward_head)
 
@@ -136,7 +125,7 @@ class WorldModel(common.Module):
             use_amp=self._use_amp,
         )
 
-    def train(self, data, state=None):
+    def _train(self, data, state=None):
         with common.RequiresGrad(self):
             with torch.cuda.amp.autocast(self._use_amp):
                 model_loss, state, outputs, metrics = self.loss(data, state)
@@ -166,12 +155,12 @@ class WorldModel(common.Module):
         )
         detach_dict = lambda x: {k: v.detach() for k, v in x.items()}
         outs = dict(
-            embed=embed.detach(),
-            feat=feat.detach(),
+            embed=embed,
+            feat=feat,
             post=detach_dict(post),
-            prior=detach_dict(prior),
-            likes=detach_dict(likes),
-            kl=kl_value.detach(),
+            prior=prior,
+            likes=likes,
+            kl=kl_value,
         )
         metrics = {
             f"{name}_loss": value.detach().cpu() for name, value in losses.items()
@@ -219,18 +208,16 @@ class WorldModel(common.Module):
         seq["discount"] = disc.unsqueeze(-1)
         # Shift discount factors because they imply whether the following state
         # will be valid, not whether the current state is valid.
-        seq["weight"] = (
-            torch.cumprod(torch.cat([torch.ones_like(disc[:1]), disc[:-1]], 0), 0)
-            .unsqueeze(-1)
-            .detach()
-        )
+        seq["weight"] = torch.cumprod(
+            torch.cat([torch.ones_like(disc[:1]), disc[:-1]], 0), 0
+        ).unsqueeze(-1)
         return seq
 
     def preprocess(self, obs):
         obs = obs.copy()
         dtype = torch.float32
         obs = {
-            k: torch.Tensor(v).to(next(self.parameters()).device)
+            k: torch.tensor(v).to(next(self.parameters()).device)
             for k, v in obs.items()
         }
         for key, value in obs.items():
@@ -240,7 +227,6 @@ class WorldModel(common.Module):
                 value = value.to(dtype)
             if value.dtype == torch.uint8:
                 value = value.to(dtype) / 255.0 - 0.5
-            value = value.to(dtype)
             obs[key] = value
         obs["reward"] = {
             "identity": lambda x: x,
@@ -310,7 +296,7 @@ class ActorCritic(nn.Module):
             **self.config.critic_opt,
         )
 
-    def train(self, world_model: WorldModel, start, is_terminal, reward_fn):
+    def _train(self, world_model: WorldModel, start, is_terminal, reward_fn):
         actor_loss, critic_loss, metrics = self.loss(
             world_model, start, is_terminal, reward_fn
         )

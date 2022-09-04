@@ -4,6 +4,7 @@ import torch
 import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
+from .trunc_normal import TruncatedNormal
 
 
 class SampleDist:
@@ -52,24 +53,6 @@ class OneHotDist(td.OneHotCategorical):
             probs = probs[None]
         sample = sample + (probs - probs.detach())
         return sample
-
-
-class TruncNormalDist(td.Normal):
-    def __init__(self, loc, scale, low, high, clip=1e-6, mult=1):
-        super().__init__(loc, scale)
-        self._low = low
-        self._high = high
-        self._clip = clip
-        self._mult = mult
-
-    def sample(self, sample_shape):
-        event = super().sample(sample_shape)
-        if self._clip:
-            clipped = torch.clip(event, self._low + self._clip, self._high - self._clip)
-            event = event - event.detach() + clipped.detach()
-        if self._mult:
-            event *= self._mult
-        return event
 
 
 class TanhBijector(td.Transform):
